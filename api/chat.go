@@ -217,35 +217,52 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	if !openAIReq.Stream {
 		var fullContent string
-		reader := bufio.NewReader(resp.Body)
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					break
+		maxRetries := 3
+		retryCount := 0
+
+		for retryCount < maxRetries {
+			fullContent = ""
+			reader := bufio.NewReader(resp.Body)
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					continue
 				}
-				continue
+
+				line = strings.TrimSpace(line)
+
+				if strings.HasPrefix(line, "event: message") {
+					dataLine, err := reader.ReadString('\n')
+					if err != nil {
+						continue
+					}
+					dataLine = strings.TrimSpace(dataLine)
+
+					if strings.HasPrefix(dataLine, "data: ") {
+						dataStr := strings.TrimPrefix(dataLine, "data: ")
+						var merlinResp MerlinResponse
+						if err := json.Unmarshal([]byte(dataStr), &merlinResp); err != nil {
+							continue
+						}
+						if merlinResp.Data.Content != " " {
+							fullContent += merlinResp.Data.Content
+						}
+					}
+				}
 			}
 
-			line = strings.TrimSpace(line)
-
-			if strings.HasPrefix(line, "event: message") {
-				dataLine, err := reader.ReadString('\n')
+			if fullContent == "" && retryCount < maxRetries-1 {
+				retryCount++
+				resp, err = client.Do(req)
 				if err != nil {
 					continue
 				}
-				dataLine = strings.TrimSpace(dataLine)
-
-				if strings.HasPrefix(dataLine, "data: ") {
-					dataStr := strings.TrimPrefix(dataLine, "data: ")
-					var merlinResp MerlinResponse
-					if err := json.Unmarshal([]byte(dataStr), &merlinResp); err != nil {
-						continue
-					}
-					if merlinResp.Data.Content != " " {
-						fullContent += merlinResp.Data.Content
-					}
-				}
+				defer resp.Body.Close()
+			} else {
+				break
 			}
 		}
 
@@ -270,47 +287,67 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
+	maxRetries := 3
+	retryCount := 0
+	hasContent := false
+
+	for retryCount < maxRetries {
+		hasContent = false
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				continue
 			}
-			continue
+
+			if strings.HasPrefix(line, "event: message") {
+				dataLine, _ := reader.ReadString('\n')
+				var merlinResp MerlinResponse
+				json.Unmarshal([]byte(strings.TrimPrefix(dataLine, "data: ")), &merlinResp)
+
+				if merlinResp.Data.Content != "" {
+					hasContent = true
+					openAIResp := OpenAIResponse{
+						Id:      generateUUID(),
+						Object:  "chat.completion.chunk",
+						Created: getCurrentTimestamp(),
+						Model:   openAIReq.Model,
+						Choices: []struct {
+							Delta struct {
+								Content string `json:"content"`
+							} `json:"delta"`
+							Index        int    `json:"index"`
+							FinishReason string `json:"finish_reason"`
+						}{{
+							Delta: struct {
+								Content string `json:"content"`
+							}{
+								Content: merlinResp.Data.Content,
+							},
+							Index:        0,
+							FinishReason: "",
+						}},
+					}
+
+					respData, _ := json.Marshal(openAIResp)
+					fmt.Fprintf(w, "data: %s\n\n", string(respData))
+					flusher.Flush()
+				}
+			}
 		}
 
-		if strings.HasPrefix(line, "event: message") {
-			dataLine, _ := reader.ReadString('\n')
-			var merlinResp MerlinResponse
-			json.Unmarshal([]byte(strings.TrimPrefix(dataLine, "data: ")), &merlinResp)
-
-			if merlinResp.Data.Content != "" {
-				openAIResp := OpenAIResponse{
-					Id:      generateUUID(),
-					Object:  "chat.completion.chunk",
-					Created: getCurrentTimestamp(),
-					Model:   openAIReq.Model,
-					Choices: []struct {
-						Delta struct {
-							Content string `json:"content"`
-						} `json:"delta"`
-						Index        int    `json:"index"`
-						FinishReason string `json:"finish_reason"`
-					}{{
-						Delta: struct {
-							Content string `json:"content"`
-						}{
-							Content: merlinResp.Data.Content,
-						},
-						Index:        0,
-						FinishReason: "",
-					}},
-				}
-
-				respData, _ := json.Marshal(openAIResp)
-				fmt.Fprintf(w, "data: %s\n\n", string(respData))
-				flusher.Flush()
+		if !hasContent && retryCount < maxRetries-1 {
+			retryCount++
+			resp, err = client.Do(req)
+			if err != nil {
+				continue
 			}
+			defer resp.Body.Close()
+			reader = bufio.NewReader(resp.Body)
+		} else {
+			break
 		}
 	}
 
